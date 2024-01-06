@@ -1,0 +1,310 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Parameters:
+
+  # env vars for docker
+  demoApiKey:
+    Type: String
+    Default: ""
+    Description: The API key for DEMO
+
+  # other params
+  latestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    # this is the latest ECS optimised Amazon Linux 2023 AMI ID. 
+    # ECS optimised means that it has some packages preinstalled, such as the ECS agent, which makes pairing EC2 and cluster possible.
+    Default: '/aws/service/ecs/optimized-ami/amazon-linux-2023/recommended/image_id'
+
+Resources:
+
+### PERMISSIONS (IAM)
+
+  # allows sending logs to CloudWatch Logs
+  CloudWatchLogsPolicy:
+    Type: 'AWS::IAM::ManagedPolicy'
+    Properties:
+      Description: 'Policy for CloudWatch Logs agent'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'logs:CreateLogGroup'
+              - 'logs:CreateLogStream'
+              - 'logs:PutLogEvents'
+            Resource: '*'
+
+  # allows aws to manage EC2 instances, create and manage EFS volumes and send logs to CloudWatch Logs. 
+  EC2InstanceRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
+        - arn:aws:iam::aws:policy/AmazonElasticFileSystemFullAccess
+        - !Ref CloudWatchLogsPolicy
+
+  # allows ECS to execute tasks
+  TaskExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - 'ecs-tasks.amazonaws.com'
+            Action:
+              - 'sts:AssumeRole'
+      Path: '/'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
+
+### NETWORKING (EC2)
+
+  # parent networking unit
+  MyVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: cf-demo-vpc
+
+  # main networking working unit
+  MySubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MyVPC
+      CidrBlock: 10.0.1.0/24
+      Tags:
+      - Key: Name
+        Value: cf-demo-subnet
+
+  # Security for ECS
+  MySecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: My security group
+      VpcId: !Ref MyVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 0
+          ToPort: 65535
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: cf-demo-sg
+
+  # Allow external internet connection to fetch docker images from docker hub
+  MyInternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  MyVPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref MyVPC
+      InternetGatewayId: !Ref MyInternetGateway
+
+  # routing
+  MyRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref MyVPC
+
+  MyInternetRoute:
+    Type: AWS::EC2::Route
+    DependsOn: MyVPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref MyRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref MyInternetGateway
+
+  MySubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref MySubnet
+      RouteTableId: !Ref MyRouteTable
+
+### STORAGE (EFS)
+# EFS ensure permanence independent of service, task and EC2. 
+# Docker volumes for logs and conf are mounted inside EFS volume mount.
+
+  CFDemoEFS:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      PerformanceMode: generalPurpose
+      FileSystemTags:
+      - Key: Name
+        Value: cf-demo-efs
+    UpdateReplacePolicy: Retain
+    DeletionPolicy: Retain
+
+  CFDemoMount:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref CFDemoEFS
+      SubnetId: !Ref MySubnet
+      SecurityGroups:
+        - !Ref MySecurityGroup
+
+### SERVER (EC2)
+
+  EC2InstanceProfile:
+    Type: 'AWS::IAM::InstanceProfile'
+    Properties:
+      Path: /
+      Roles:
+        - !Ref EC2InstanceRole
+
+  MyEC2Instance:
+    Type: 'AWS::EC2::Instance'
+    Properties:
+      Tags:
+        - Key: Name
+          Value: cf-demo-ec2
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      ImageId: !Ref latestAmiId
+      InstanceType: 't3.small' # must be at least as powerful as our task definition.
+      KeyName: 'demo_keypair' # allows ssh access
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: 'true'
+          DeviceIndex: '0'
+          GroupSet:
+            - !Ref MySecurityGroup
+          SubnetId: !Ref MySubnet
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+
+          ### CLUSTER (Make EC2 attachable to cluster by service)
+          # Set the ECS cluster name in the ECS agent configuration file
+          mkdir -p /etc/ecs
+          echo ECS_CLUSTER=cf-demo-cluster >> /etc/ecs/ecs.config
+
+          # Install the ecs-init package (should be installed by default on ECS optimised Amazon Linux distros)
+          # yum install -y ecs-init
+
+          # Start and enable the Docker service (ECS service runs as a docker container)
+          systemctl start docker
+          systemctl enable docker
+
+          # Start and enable the ECS service (runs as a docker container)
+          systemctl start --no-block ecs
+          systemctl enable --no-block ecs
+
+          ### VOLUMES
+          # EFS and docker binds are mounted in different points of the tree to void conflicts.
+
+          # Create directories
+          mkdir /mnt/efs # will mount EFS volume
+          # will docker bind mount inside EFS volume mount.
+          mkdir /mnt/efs/conf
+          mkdir /mnt/efs/log 
+
+          # EFS
+          # Install the Amazon EFS utilities package (should be installed by default on ECS optimised Amazon Linux distros)
+          # yum install -y amazon-efs-utils
+
+          # Mount the EFS file system at the created directory
+          mount -t efs ${CFDemoEFS}:/ /mnt/efs
+
+          # Add the EFS file system to the fstab file so that they get mounted on a system reboot (UserData only executes on first boot)
+          echo '${CFDemoEFS}:/ /mnt/efs efs defaults,_netdev' >> /etc/fstab
+
+          ### LOG ANALYSIS (CLOUDWATCH)
+          # Install the CloudWatch Logs agent for Amazon Linux
+          yum install -y amazon-cloudwatch-agent
+
+          # Configure the CloudWatch Logs agent to monitor the docker log file and send the data to CloudWatch Logs
+          touch /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+
+          cat <<EOF >> /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+          {
+            "logs": {
+              "logs_collected": {
+                "files": {
+                  "collect_list": [
+                    {
+                      "file_path": "/mnt/efs/log/demo.jsonl",
+                      "log_group_name": "demo-log-group",
+                      "log_stream_name": "{instance_id}",
+                      "timestamp_format": "%Y-%m-%dT%H:%M:%S.%fZ"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+          EOF
+
+          # Start the CloudWatch Logs agent
+          systemctl start amazon-cloudwatch-agent
+          systemctl enable amazon-cloudwatch-agent
+
+
+### WORK HORSES (ECS)
+
+  # In AWS, everything happens inside a cluster.
+  CFDemoCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: cf-demo-cluster
+
+  # Main logic. Will spin docker container.
+  CFDemoTask:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: cf-demo-task
+      Cpu: 1024
+      Memory: 1024
+      NetworkMode: bridge
+      ExecutionRoleArn: !Ref TaskExecutionRole # ignore error in CloudFormation plugin
+      TaskRoleArn: !Ref TaskExecutionRole
+      ContainerDefinitions:
+        - Name: demo-container
+          Image: demo/demo:latest
+          LinuxParameters:
+            InitProcessEnabled: true
+          Cpu: 1024
+          Memory: 1024
+          Essential: true
+          PortMappings:
+            - ContainerPort: 5380
+              HostPort: 5380
+          Environment:
+            - Name: DEMO_API_KEY
+              Value: !Ref demoApiKey
+          MountPoints:
+            - ContainerPath: /app/log
+              SourceVolume: demo-log-vol
+            - ContainerPath: /app/conf
+              SourceVolume: demo-conf-vol
+      Volumes:
+        - Name: demo-log-vol
+          Host: 
+            SourcePath: /mnt/efs/log
+        - Name: demo-conf-vol
+          Host: 
+            SourcePath: /mnt/efs/conf
+
+  # ECS service. Will spin our task inside a cluster, and will smartly allocate an EC2 instance to run it.
+  CFDemoService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: cf-demo-svc
+      EnableExecuteCommand: true
+      Cluster: !Ref CFDemoCluster
+      TaskDefinition: !Ref CFDemoTask
+      DesiredCount: 1
+      LaunchType: EC2
