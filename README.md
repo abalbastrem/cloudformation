@@ -1,4 +1,7 @@
-README
+# README
+This project deploys a docker image on Amazon Web Services (aws), assuming the docker has two volumes (conf and log).
+It redirects logs onto CloudWatch, which is Amazon's log analysis tool.
+It allows to peek inside docker because it's deployed using EC2.
 
 ## USER
 1. Create AWS user
